@@ -1,0 +1,268 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{parskip}
+
+\definecolor{pantone186}{RGB}{200,16,46}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=pantone186,
+  urlcolor=pantone186,
+  citecolor=pantone186,
+  pdftitle={Modelamiento de carga a la base de datos - usuario comun},
+  pdfauthor={Equipo Ticketera Nestjs}
+}
+
+\titleformat{\section}{\normalfont\Large\bfseries\color{pantone186}}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{1em}{}
+
+\pagestyle{fancy}
+\setlength{\headheight}{14pt}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyhead[L]{Modelamiento de carga a la base de datos}
+\fancyhead[R]{\thepage}
+\fancyfoot[C]{Documento interno — confidencial}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{\color{pantone186}\textbf{Modelamiento de carga a la base de datos}\\[0.3em]
+\Large Según el perfil de un usuario común (rol Agente)}
+\author{Proyecto Ticketera Nestjs}
+\date{22 de septiembre de 2026 \\ Versión 1.0}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\newpage
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Objetivo y alcance}
+
+Este documento estima la carga que un usuario típico del sistema genera
+sobre PostgreSQL, y la contrasta contra los límites de infraestructura ya
+fijados en el proyecto (pool de conexiones, \emph{timeouts}, tamaño de lote
+del \emph{scheduler} de SLA). El propósito es identificar si la
+configuración actual —pensada y medida, no adivinada, según
+\texttt{CLAUDE.md}— soporta el volumen de uso esperado, y en qué punto deja
+de hacerlo.
+
+No es una medición contra tráfico real: el proyecto no tiene aún usuarios
+de producción, solo el \emph{seed} de prueba (5 usuarios, ver
+\S\ref{sec:supuestos}). Es un modelo estimativo, con supuestos explícitos,
+pensado para poder recalcularse cuando existan métricas reales.
+
+% =====================================================================
+\section{Perfil de usuario modelado}
+
+Se eligió el rol \textbf{AGENTE} como "usuario común" del sistema, por
+sobre REQUESTER y SUPERVISOR/ADMIN, por tres razones:
+
+\begin{itemize}[leftmargin=1.2cm]
+  \item Es quien más interactúa con la base durante una jornada completa:
+    un REQUESTER típico solo abre el sistema para crear un ticket o
+    revisar su estado —sesiones cortas y esporádicas—, mientras que el
+    agente trabaja contra el sistema toda su jornada laboral.
+  \item Es, numéricamente, el rol más repetido entre los usuarios activos
+    de un sistema de mesa de ayuda: hay muchos más agentes atendiendo que
+    supervisores o administradores.
+  \item Es el rol que dispara la mayor variedad de operaciones sobre
+    \texttt{tickets}: listar, ver detalle, comentar, cambiar estado — el
+    conjunto completo de escrituras del dominio, salvo la creación
+    (típicamente del REQUESTER o de la ingesta de correo) y la
+    administración de usuarios (ADMIN).
+\end{itemize}
+
+Al final del documento (\S\ref{sec:otros-perfiles}) se compara brevemente
+contra REQUESTER, para dimensionar cuánto pesa cada perfil en el total.
+
+% =====================================================================
+\section{Supuestos del modelo}
+\label{sec:supuestos}
+
+Ningún supuesto de volumen está documentado en el proyecto (el \emph{seed}
+solo trae 2 agentes de prueba), así que se fijan explícitamente aquí, con
+un criterio conservador de institución mediana:
+
+\begin{itemize}[leftmargin=1.2cm]
+  \item Jornada de \textbf{8 horas} (28\,800 segundos) por agente.
+  \item \textbf{20 agentes} concurrentes en horario de mayor actividad —
+    cifra asumida, ajustable; todos los cálculos de esta sección escalan
+    linealmente con este número.
+  \item El agente revisa su panel (\emph{dashboard}) al iniciar turno y
+    luego \textbf{cada 45 minutos} aproximadamente (refresco manual o
+    vuelta a la pestaña): 10 cargas de \emph{dashboard} por turno.
+  \item Además del \emph{dashboard}, hace \textbf{15 búsquedas/listados}
+    de tickets sueltas por turno.
+  \item Abre el \textbf{detalle de 20 tickets} por turno; en un 30\% de
+    esos casos puede reasignar (dispara una consulta adicional a
+    \texttt{users-service}).
+  \item Escribe \textbf{12 comentarios} y realiza \textbf{8 cambios de
+    estado} por turno.
+  \item No crea tickets ni administra usuarios (eso corresponde a
+    REQUESTER y ADMIN respectivamente).
+\end{itemize}
+
+% =====================================================================
+\section{De acción de usuario a consultas SQL}
+
+Cada acción del agente se traduce en una o más llamadas RPC (BFF o gateway
+→ microservicio), y cada llamada en una o más consultas a PostgreSQL. La
+tabla siguiente mapea eso, a partir del código real: los \emph{composers}
+del BFF (\texttt{apps/bff-web/src/composers/}) y los casos de uso de
+\texttt{tickets-service}.
+
+\begin{longtable}{@{}>{\bfseries}p{3.3cm} L{4.6cm} p{1.6cm} p{1.4cm} p{1.3cm}@{}}
+\toprule
+\textbf{Acción} & \textbf{Qué dispara} & \textbf{Queries/ evento} & \textbf{Frec./ turno} & \textbf{Total} \\
+\midrule
+\endhead
+Inicio de sesión & \texttt{users-service}: \texttt{SELECT} por email + \texttt{UPDATE} de último acceso & 2 & 1 & 2 \\
+Carga de \emph{dashboard} & \texttt{AgentDashboardComposer}: 6 llamadas RPC en paralelo (4× \texttt{tickets.search}, \texttt{tickets.statsByAgent}, \texttt{notifications.findForUser}); cada \texttt{search} pagina (consulta + \texttt{COUNT}) & 10 & 10 & 100 \\
+Listado/búsqueda suelta & \texttt{TicketListComposer}: \texttt{tickets.search} + \texttt{COUNT} & 2 & 15 & 30 \\
+Detalle de ticket & \texttt{TicketDetailComposer}: \texttt{tickets.findById} (con \emph{joins}) + \texttt{users.find-many} si puede reasignar (30\% de los casos) & 1{,}3 & 20 & 26 \\
+Comentario & Lectura de autorización + \texttt{INSERT ticket\_comments} en \texttt{tickets-service}; evento \texttt{ticket.commented} dispara en \texttt{notifications-service} resolución de destinatario + \texttt{INSERT notifications} & 4 & 12 & 48 \\
+Cambio de estado & \texttt{SELECT ... FOR UPDATE} (lock pesimista) + \texttt{UPDATE ticket} + \texttt{INSERT ticket\_status\_history}; evento \texttt{ticket.status-changed} dispara 2 queries más en \texttt{notifications-service} & 5 & 8 & 40 \\
+\midrule
+\textbf{Total por agente / turno} & & & & \textbf{246} \\
+\bottomrule
+\end{longtable}
+
+Con 246 consultas en 28\,800 segundos, el promedio por agente es de
+\textbf{\textasciitilde 0{,}0085 consultas/segundo} — una cifra trivial en
+sí misma. El riesgo no está en el promedio: está en la concentración de
+esas consultas en ráfagas cortas, que se analiza a continuación.
+
+% =====================================================================
+\section{Carga agregada y análisis de concurrencia}
+
+\subsection{Carga promedio del equipo}
+
+Con 20 agentes concurrentes bajo los mismos supuestos:
+\[
+20 \times 246 = 4\,920 \text{ consultas / turno de 8h} \approx 0{,}17 \text{ consultas/segundo en promedio}
+\]
+
+Muy por debajo de cualquier límite de \texttt{DB\_POOL\_MAX=10}: en
+régimen estacionario, el pool de 10 conexiones sobra con holgura para este
+volumen.
+
+\subsection{El problema real: ráfagas, no promedio}
+
+Dos eventos del sistema concentran consultas en ventanas de segundos, y son
+los que efectivamente presionan el pool de 10 conexiones:
+
+\begin{enumerate}[leftmargin=1.2cm]
+  \item \textbf{Inicio de turno simultáneo.} Si los 20 agentes inician
+    sesión y cargan su \emph{dashboard} dentro de una ventana de 2 minutos
+    (escenario típico: turno que arranca a una hora fija), se generan
+    $20 \times (2 + 10) = 240$ consultas en 120 segundos, con picos
+    instantáneos de hasta $20 \times 6 = 120$ llamadas RPC casi
+    simultáneas — cada una necesita una conexión del pool mientras dura su
+    consulta. Con \texttt{statement\_timeout=5\,000\,ms}, una consulta
+    lenta retiene su conexión hasta 5 segundos; si más de 10 agentes caen
+    en el mismo instante, las siguientes esperan en cola por una conexión
+    libre.
+  \item \textbf{Corrida del \emph{scheduler} de SLA}. Corre cada
+    \texttt{EVERY\_5\_MINUTES} y procesa hasta \texttt{BATCH\_SIZE=200}
+    tickets por barrido. En un escenario realista (no los 200 completos,
+    sino ~15 tickets que efectivamente incumplen SLA en una corrida), esto
+    dispara 1 \texttt{SELECT} de barrido + 15 \texttt{UPDATE} + 15
+    \texttt{INSERT} de historial + eventos a \texttt{notifications-service}
+    (~30 consultas más) — unas \textbf{46 consultas concentradas en menos
+    de 1 segundo}, cada 5 minutos, \textbf{independientemente} de cuántos
+    agentes estén conectados. Si esta corrida coincide con el pico de
+    inicio de turno, ambas ráfagas compiten por el mismo pool de 10
+    conexiones.
+\end{enumerate}
+
+Este es el mismo tipo de riesgo que \texttt{CLAUDE.md} ya documenta para
+\texttt{AssignTicketUseCase}: con \texttt{DB\_POOL\_MAX=10}, diez
+operaciones concurrentes que retengan una conexión agotan el pool contra sí
+mismas. El modelo confirma que el punto de fricción no es el volumen diario
+de un agente —trivial—, sino la coincidencia de ráfagas de corta duración.
+
+\subsection{Confrontación con los límites de infraestructura}
+
+\begin{longtable}{@{}>{\bfseries}p{4.3cm} p{3.6cm} L{4.8cm}@{}}
+\toprule
+\textbf{Límite configurado} & \textbf{Valor} & \textbf{Lectura frente al modelo} \\
+\midrule
+\endhead
+\texttt{DB\_POOL\_MAX} & 10 conexiones & Suficiente en régimen estacionario (0{,}17 consultas/seg); insuficiente si $>$10 operaciones de ráfaga caen en el mismo instante. \\
+\texttt{statement\_timeout} & 5\,000\,ms & Acota cuánto puede retener una conexión una consulta lenta durante una ráfaga; no evita la cola, solo el bloqueo indefinido. \\
+\texttt{lock\_timeout} & 3\,000\,ms & Relevante en cambios de estado concurrentes sobre el mismo ticket (\texttt{FOR UPDATE}); no aplica a la carga de lectura del \emph{dashboard}. \\
+\texttt{THROTTLE\_LIMIT} & 100 req. / 60\,000\,ms (por instancia de gateway) & A nivel HTTP, 20 agentes generando ráfagas de \emph{dashboard} (6 llamadas c/u) están muy por debajo del límite; el \emph{throttling} no es el cuello de botella para este perfil. \\
+\texttt{BATCH\_SIZE} SLA & 200 tickets / corrida, cada 5 min & Fuente de carga \emph{independiente} del número de agentes conectados; debe sumarse a cualquier pico de uso humano al dimensionar el pool. \\
+\bottomrule
+\end{longtable}
+
+% =====================================================================
+\section{Otros perfiles, para contraste}
+\label{sec:otros-perfiles}
+
+\begin{itemize}[leftmargin=1.2cm]
+  \item \textbf{REQUESTER}: sesión típica de 2-3 acciones (crear ticket,
+    revisar estado, comentar) en vez de una jornada completa. Carga
+    estimada por sesión: 1 \texttt{INSERT} (crear ticket, con su
+    clasificación de urgencia y cálculo de SLA en la misma transacción) +
+    1-2 lecturas de detalle $\approx$ 4-6 consultas por sesión, muy por
+    debajo de las 246 del agente. Aun con un volumen de REQUESTERs varias
+    veces mayor al de agentes, su carga total es comparable o menor,
+    porque sus sesiones son mucho más cortas y espaciadas.
+  \item \textbf{SUPERVISOR/ADMIN}: carga por sesión más alta que la del
+    agente cuando genera reportes o pantallas de \texttt{privacy-dossier}
+    (portabilidad ARCO) — esta última puede disparar más de 90 consultas
+    en una sola solicitud (hasta 50 páginas de 1\,000 tickets por lote,
+    más comentarios y notificaciones), pero es una acción infrecuente
+    (no diaria), por lo que no domina el modelo agregado.
+\end{itemize}
+
+% =====================================================================
+\section{Conclusiones y recomendaciones}
+
+\begin{itemize}[leftmargin=1.2cm]
+  \item El volumen \emph{promedio} de consultas por agente (\textasciitilde
+    0{,}0085 consultas/seg) es irrelevante frente a la capacidad del pool
+    actual; \textbf{no justifica, por sí solo, subir \texttt{DB\_POOL\_MAX}}.
+  \item El riesgo real está en la \textbf{coincidencia de ráfagas}: inicio
+    de turno simultáneo de varios agentes y la corrida del \emph{scheduler}
+    de SLA. Si el equipo crece más allá de los \textasciitilde 20 agentes
+    asumidos, o si se agregan más corridas periódicas (schedulers
+    adicionales), conviene volver a correr este modelo con el número real
+    de agentes concurrentes.
+  \item Medir esto en producción es más confiable que seguir extrapolando
+    el supuesto de 20 agentes: instrumentar el número de conexiones activas
+    del pool durante el inicio de turno real daría la cifra que hoy es
+    estimada.
+  \item Si la medición real muestra agotamiento del pool durante el pico de
+    inicio de turno, la primera palanca es \textbf{escalonar el
+    \emph{login}} (no técnica, sino operativa: no todos los agentes
+    entran a la vez) antes que subir \texttt{DB\_POOL\_MAX}, porque este
+    último ya tiene un costo documentado: valores altos multiplicados por
+    réplicas de servicio agotan conexiones de PostgreSQL más rápido de lo
+    que se gana en concurrencia (ver \texttt{CLAUDE.md}, sección de base de
+    datos).
+  \item Vale la pena revisar si el \emph{scheduler} de SLA
+    (\texttt{EVERY\_5\_MINUTES}) puede desplazarse fuera de los minutos
+    típicos de inicio de turno (ej. \texttt{:02}, \texttt{:07}...) para no
+    competir con el pico humano por el mismo pool.
+\end{itemize}
+
+\end{document}

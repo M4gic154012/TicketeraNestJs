@@ -1,0 +1,360 @@
+name: ticketera
+
+# Anclas reutilizables ------------------------------------------------------
+x-logging: &default-logging
+  # json-file sin límites crece hasta llenar el disco. Con healthchecks cada 15s
+  # el volumen de log es constante, así que el techo no es opcional.
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '3'
+
+# Configuración común a todos los procesos Node. NO incluye secretos: cada
+# servicio declara abajo solo los que necesita.
+x-node-common: &node-common
+  NODE_ENV: production
+  # Fijo, no tomado del .env: un LOG_LEVEL=debug de desarrollo colándose en un
+  # contenedor "production" es cómo terminás logueando payloads completos.
+  LOG_LEVEL: info
+  TZ: ${TZ:-America/Santiago}
+  MICROSERVICE_BIND_HOST: 0.0.0.0
+  RPC_SHARED_SECRET: ${RPC_SHARED_SECRET:?RPC_SHARED_SECRET es obligatoria}
+
+x-db-connection: &db-connection
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: ${DB_USER:-ticketera}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD es obligatoria}
+  DB_NAME: ${DB_NAME:-ticketera}
+  DB_POOL_MAX: ${DB_POOL_MAX:-10}
+  DB_SSL: ${DB_SSL:-false}
+
+x-service-hosts: &service-hosts
+  BFF_WEB_HOST: bff-web
+  BFF_WEB_TCP_PORT: 4001
+  USERS_HOST: users-service
+  USERS_TCP_PORT: 4101
+  TICKETS_HOST: tickets-service
+  TICKETS_TCP_PORT: 4102
+  NOTIFICATIONS_HOST: notifications-service
+  NOTIFICATIONS_TCP_PORT: 4103
+  EMAIL_INGESTION_HOST: email-ingestion-service
+  EMAIL_INGESTION_TCP_PORT: 4104
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${DB_USER:-ticketera}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD es obligatoria}
+      POSTGRES_DB: ${DB_NAME:-ticketera}
+    ports:
+      # Solo loopback: la base no debe quedar expuesta a la red de la máquina.
+      - '127.0.0.1:${DB_PORT:-5432}:5432'
+    # max_connections explícito: DB_POOL_MAX (10) × 3 servicios con base = 30 hoy.
+    # El default de 100 se agota con 3 réplicas por servicio y el síntoma aparece
+    # en el arranque de la última ("too many clients"), no bajo carga.
+    command:
+      - postgres
+      - -c
+      - max_connections=${DB_MAX_CONNECTIONS:-120}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      # Los servicios dependen de este healthcheck: arrancar antes de que
+      # Postgres acepte conexiones hace fallar la primera migración.
+      test: ['CMD-SHELL', 'pg_isready -U ${DB_USER:-ticketera} -d ${DB_NAME:-ticketera}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # Aplica las migraciones y termina. Los servicios con base de datos esperan a
+  # que salga con éxito, así que un esquema desactualizado bloquea el arranque en
+  # lugar de dar cinco contenedores "healthy" contra una base vacía.
+  migrator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: migrator
+    restart: 'no'
+    logging: *default-logging
+    environment:
+      <<: *db-connection
+      NODE_ENV: development
+      TZ: ${TZ:-America/Santiago}
+      # El CLI de TypeORM valida su propio entorno, pero el data-source comparte
+      # el esquema de Joi: se le dan los secretos mínimos para que pase.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET es obligatoria}
+      RPC_SHARED_SECRET: ${RPC_SHARED_SECRET:?RPC_SHARED_SECRET es obligatoria}
+    networks: [data]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: api-gateway
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: [*node-common, *service-hosts]
+      GATEWAY_HTTP_PORT: 3000
+      # El gateway es el ÚNICO que recibe JWT_SECRET: es el único que firma y
+      # verifica tokens. Y NO recibe DB_PASSWORD: no habla con Postgres.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET es obligatoria}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-7d}
+      JWT_ISSUER: ${JWT_ISSUER:-ticketera}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-ticketera-api}
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS es obligatoria}
+      THROTTLE_TTL_MS: ${THROTTLE_TTL_MS:-60000}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-100}
+      # Se toma del .env. En producción el esquema exige SWAGGER_USER y
+      # SWAGGER_PASSWORD cuando está en true, así que no puede quedar público por un
+      # olvido: si faltan las credenciales, el gateway no arranca.
+      ENABLE_SWAGGER: ${ENABLE_SWAGGER:-false}
+      SWAGGER_USER: ${SWAGGER_USER:-}
+      SWAGGER_PASSWORD: ${SWAGGER_PASSWORD:-}
+      CB_TIMEOUT_MS: ${CB_TIMEOUT_MS:-3000}
+    ports:
+      - '${GATEWAY_HTTP_PORT:-3000}:3000'
+    # Está en `edge` (recibe tráfico) y en `app` (habla con BFF y servicios), pero
+    # NO en `data`: así la regla "el gateway no accede a la base" la sostiene la
+    # red, no solo el código.
+    networks: [edge, app]
+    depends_on:
+      bff-web:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('http').get('http://127.0.0.1:3000/api/v1/health/ready',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Mayor que el TimeoutInterceptor (15s) del gateway: si Docker mata antes, una
+    # request lenta legítima se corta igual pese a los shutdown hooks.
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  bff-web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: bff-web
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      # Sin JWT_SECRET y sin DB_PASSWORD: el BFF no firma tokens ni toca la base.
+      <<: [*node-common, *service-hosts]
+    networks: [app]
+    depends_on:
+      users-service:
+        condition: service_healthy
+      tickets-service:
+        condition: service_healthy
+      notifications-service:
+        condition: service_healthy
+    healthcheck:
+      # Un proceso colgado (pool agotado, event loop bloqueado) sigue "Up" para
+      # siempre sin esto: `restart` solo reacciona a que el proceso muera.
+      test: ['CMD', 'node', '-e', "require('net').connect(4001,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  users-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: users-service
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: [*node-common, *db-connection]
+      BCRYPT_ROUNDS: ${BCRYPT_ROUNDS:-12}
+    networks: [app, data]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('net').connect(4101,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  tickets-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: tickets-service
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: [*node-common, *db-connection, *service-hosts]
+      SLA_CRITICAL_MINUTES: ${SLA_CRITICAL_MINUTES:-60}
+      SLA_HIGH_MINUTES: ${SLA_HIGH_MINUTES:-240}
+      SLA_MEDIUM_MINUTES: ${SLA_MEDIUM_MINUTES:-1440}
+      SLA_LOW_MINUTES: ${SLA_LOW_MINUTES:-4320}
+      # Con más de una réplica, solo una debe registrar los crons: el guard
+      # anti-solapamiento es memoria local, no un lock distribuido.
+      SCHEDULER_ENABLED: ${TICKETS_SCHEDULER_ENABLED:-true}
+    networks: [app, data]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('net').connect(4102,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  notifications-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: notifications-service
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: [*node-common, *db-connection, *service-hosts]
+      NOTIFICATION_RETENTION_DAYS: ${NOTIFICATION_RETENTION_DAYS:-90}
+      SCHEDULER_ENABLED: ${NOTIFICATIONS_SCHEDULER_ENABLED:-true}
+    networks: [app, data]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('net').connect(4103,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # Ingesta de tickets por correo. Servicio aparte y no un módulo dentro de
+  # tickets-service: aísla una dependencia externa y frágil (el servidor de correo) y
+  # tiene su propio poller, así que si el buzón no responde el resto sigue andando.
+  email-ingestion-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args:
+        APP_NAME: email-ingestion-service
+        GIT_SHA: ${GIT_SHA:-dev}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: [*node-common, *db-connection, *service-hosts]
+      MAIL_INGESTION_ENABLED: ${MAIL_INGESTION_ENABLED:-false}
+      MAIL_ADAPTER: ${MAIL_ADAPTER:-simulado}
+      MAIL_ADDRESS: ${MAIL_ADDRESS:-soporte@cmm.uchile.cl}
+      MAIL_ALLOWED_DOMAINS: ${MAIL_ALLOWED_DOMAINS:-uchile.cl}
+      MAIL_POLL_BATCH_SIZE: ${MAIL_POLL_BATCH_SIZE:-25}
+      # Ruta DENTRO del contenedor: el directorio del host se monta abajo.
+      MAIL_SIMULATED_DIR: /app/correos-prueba
+      MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-}
+      MAIL_IMAP_PORT: ${MAIL_IMAP_PORT:-993}
+      MAIL_IMAP_USER: ${MAIL_IMAP_USER:-}
+      MAIL_IMAP_PASSWORD: ${MAIL_IMAP_PASSWORD:-}
+      MAIL_IMAP_MAILBOX: ${MAIL_IMAP_MAILBOX:-INBOX}
+      SCHEDULER_ENABLED: ${EMAIL_SCHEDULER_ENABLED:-true}
+    volumes:
+      # Solo lo usa el adaptador simulado, para poder dejar .eml de prueba desde el
+      # host. Con MAIL_ADAPTER=imap este montaje es inofensivo.
+      - ../correos-prueba:/app/correos-prueba
+    networks: [app, data]
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD', 'node', '-e', "require('net').connect(4104,'127.0.0.1').on('connect',function(){this.end();process.exit(0)}).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+networks:
+  # Tres segmentos en lugar de una red plana:
+  #   edge  — solo el gateway. Es lo único que recibe tráfico de afuera.
+  #   app   — gateway + BFF + los tres servicios. El transporte RPC interno.
+  #   data  — postgres + los tres servicios que persisten. Sin salida al exterior.
+  # El gateway no está en `data`, así que no alcanza Postgres a nivel de red
+  # aunque alguien introduzca por error una dependencia de base en su código.
+  edge:
+  # `app` sí es interna: no hay ningún puerto publicado desde ella.
+  app:
+    internal: true
+  # `data` NO lleva `internal: true`, y es deliberado: una red interna de Docker no
+  # permite publicar puertos al host, así que con ella activa el mapeo
+  # `127.0.0.1:5432` queda sin efecto — y con él se rompen `npm run migration:run`,
+  # `psql` desde el host y el desarrollo local, donde los procesos apuntan a
+  # 127.0.0.1:5432.
+  #
+  # El aislamiento que importa se conserva igual: el gateway no está en `data`, así
+  # que no alcanza a Postgres (da ENOTFOUND), y el puerto se publica solo en loopback,
+  # no en la LAN. Lo único que se cede es que la red tenga salida a internet.
+  data:
+
+volumes:
+  postgres-data:

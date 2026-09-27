@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ES2023",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "ignoreDeprecations": "6.0",
+    "skipLibCheck": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "strictBindCallApply": true,
+    "forceConsistentCasingInFileNames": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "paths": {
+      "@ticketera/common": ["libs/common/src"],
+      "@ticketera/common/*": ["libs/common/src/*"],
+      "@ticketera/database": ["libs/database/src"],
+      "@ticketera/database/*": ["libs/database/src/*"],
+      "@ticketera/patterns": ["libs/patterns/src"],
+      "@ticketera/patterns/*": ["libs/patterns/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist"]
+}

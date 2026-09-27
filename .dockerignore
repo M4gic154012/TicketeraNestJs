@@ -1,0 +1,15 @@
+node_modules
+dist
+coverage
+.git
+.env
+.env.local
+*.log
+# Los respaldos contienen datos reales (PII y hashes): no deben entrar ni en una
+# capa intermedia del build, aunque la imagen final quede limpia.
+backups
+test
+.claude
+*.md
+.vscode
+.idea
