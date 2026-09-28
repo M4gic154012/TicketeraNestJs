@@ -244,9 +244,17 @@ jobs:
       # de compose exigen RPC_SHARED_SECRET/DB_PASSWORD/JWT_SECRET/CORS_ORIGINS
       # (ver docker-compose.yml) y el esquema de Joi rechaza explícitamente los
       # placeholders de .env.example, así que no alcanza con copiarlo.
+      # DB_USER/DB_NAME quedan explícitos y no solo en el default de
+      # docker-compose.yml (${DB_USER:-ticketera}): ese default lo resuelve
+      # compose al armar los contenedores, nunca llega a este .env. Sin esto,
+      # `npm run seed` y `npm run test:e2e` corriendo en el host (no en un
+      # contenedor) se conectan sin usuario -- pg cae al usuario del sistema
+      # operativo del runner ("runner"), que no existe en la base.
       - name: Generar .env efímero para el stack de CI
         run: |
           cat > .env <<EOF
+          DB_USER=ticketera
+          DB_NAME=ticketera
           DB_PASSWORD=$(openssl rand -base64 48 | tr -d '\n=+/')
           JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n=+/')
           RPC_SHARED_SECRET=$(openssl rand -base64 48 | tr -d '\n=+/')
