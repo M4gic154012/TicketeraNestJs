@@ -1,6 +1,7 @@
 export * from './contracts';
 export * from './events';
 export * from './config';
+export * from './context';
 export * from './dto';
 export * from './decorators';
 export * from './filters';

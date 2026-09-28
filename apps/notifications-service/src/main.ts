@@ -2,7 +2,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { MicroserviceOptions, Transport } from '@nestjs/microservices';
-import { AllRpcExceptionsFilter, RpcAuthGuard } from '@ticketera/common';
+import { AllRpcExceptionsFilter, RpcAuthGuard, RpcCorrelationInterceptor } from '@ticketera/common';
 import { Logger } from 'nestjs-pino';
 import { NotificationsModule } from './notifications.module';
 
@@ -31,6 +31,11 @@ async function bootstrap(): Promise<void> {
   // Autenticación entre servicios: ningún handler atiende un mensaje sin el
   // secreto compartido, ni siquiera si alguien alcanza el puerto directamente.
   app.useGlobalGuards(new RpcAuthGuard(app.get(ConfigService)));
+  // Debe registrarse antes de que cualquier handler use RequestContext: deja
+  // el correlation-id del mensaje entrante disponible para toda la llamada,
+  // incluidas las llamadas RPC que ese handler haga a su vez hacia otro
+  // servicio (ver rpc-correlation.interceptor.ts).
+  app.useGlobalInterceptors(new RpcCorrelationInterceptor());
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: false }),
   );

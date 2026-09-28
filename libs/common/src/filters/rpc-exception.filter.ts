@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { RpcException } from '@nestjs/microservices';
 import { throwError } from 'rxjs';
+import { RequestContext } from '../context/request-context';
 import { DomainError } from './domain.errors';
 import { UPSTREAM_UNAVAILABLE_ERROR, isTransportFailure } from './transport-failure';
 
@@ -15,6 +16,7 @@ export interface SerializedRpcError {
   message: string;
   httpStatus: number;
   details?: Record<string, unknown>;
+  correlationId?: string;
 }
 
 /**
@@ -30,15 +32,24 @@ export class AllRpcExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger(AllRpcExceptionsFilter.name);
 
   catch(exception: unknown, _host: ArgumentsHost) {
-    const serialized = this.serialize(exception);
+    // No pisa un correlationId que ya venía en un error re-propagado desde
+    // otro servicio (ver isSerializedRpcError más abajo): en ese caso es el
+    // mismo valor de todos modos, porque viaja intacto en el payload RPC desde
+    // el primer salto, pero conservar el que ya trae evita depender de que
+    // RequestContext siga activo en el momento exacto de la repropagación.
+    const serialized = {
+      ...this.serialize(exception),
+    };
+    serialized.correlationId ??= RequestContext.correlationId;
 
+    const prefix = serialized.correlationId ? `[${serialized.correlationId}] ` : '';
     if (serialized.httpStatus >= 500) {
       this.logger.error(
-        `${serialized.code}: ${serialized.message}`,
+        `${prefix}${serialized.code}: ${serialized.message}`,
         (exception as Error)?.stack,
       );
     } else {
-      this.logger.warn(`${serialized.code}: ${serialized.message}`);
+      this.logger.warn(`${prefix}${serialized.code}: ${serialized.message}`);
     }
 
     return throwError(() => new RpcException(serialized).getError());
