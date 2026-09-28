@@ -29,6 +29,19 @@ const OWNED_PREFIXES = [
 ];
 
 /**
+ * Variables que la propia plataforma de CI define y que por pura coincidencia
+ * comparten un prefijo con las nuestras (`ENABLE_` de `ENABLE_SWAGGER`, acá).
+ * No son del proyecto y no hay forma de que el `.env` las declare, así que se
+ * excluyen por nombre en vez de sumarlas al esquema — sumarlas ahí las haría
+ * pasar por una variable que el proyecto entiende y usa, que no es el caso.
+ */
+const EXTERNAL_ENV_ALLOWLIST = new Set([
+  // Runners hospedados de GitHub Actions: variable interna de diagnóstico del
+  // propio runner. Ver el job `test` en .github/workflows/ci.yml.
+  'ENABLE_RUNNER_TRACING',
+]);
+
+/**
  * Valida el entorno.
  *
  * `allowUnknown` queda en `true` y NO es negociable: `@nestjs/config` valida
@@ -53,7 +66,10 @@ export function validateEnv(config: Record<string, unknown>): Record<string, unk
 
   const declared = new Set(Object.keys(envValidationSchema.describe().keys));
   const suspicious = Object.keys(config).filter(
-    (key) => !declared.has(key) && OWNED_PREFIXES.some((prefix) => key.startsWith(prefix)),
+    (key) =>
+      !declared.has(key) &&
+      !EXTERNAL_ENV_ALLOWLIST.has(key) &&
+      OWNED_PREFIXES.some((prefix) => key.startsWith(prefix)),
   );
 
   if (suspicious.length > 0) {
