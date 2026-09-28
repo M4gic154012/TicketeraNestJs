@@ -1,0 +1,274 @@
+name: CI
+
+# Gatilla en push a las ramas de trabajo y en cualquier PR contra main. Un push
+# nuevo sobre la misma rama cancela la corrida anterior: no tiene sentido
+# terminar de auditar un commit que ya quedó atrás.
+on:
+  push:
+    branches: [main, developer, feature]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # --- Gates rápidos: no tocan base de datos, corren en paralelo -----------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # Sin --fix: en CI un hallazgo se reporta, nunca se corrige solo.
+      - run: npm run lint:ci
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  test:
+    name: Tests unitarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --ci
+
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # audit-level=high: no bloquea por hallazgos low/moderate, que en este
+      # ecosistema son en su mayoría ruido de devDependencies transitivas.
+      - run: npm audit --audit-level=high
+
+  build:
+    name: Build (los 6 procesos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  # --- Migraciones contra un Postgres real ----------------------------------
+  #
+  # No alcanza con que el build compile: `migration:generate` no existe
+  # justamente porque el schema-builder de TypeORM no puede expresar los
+  # índices GIN/trgm, parciales y funcionales de este esquema (ver
+  # CLAUDE.md). El único chequeo real de que las migraciones a mano son
+  # correctas es aplicarlas, revertirlas y volver a aplicarlas contra un
+  # motor de verdad — no contra sqlite ni un mock.
+  migrations:
+    name: Migraciones (run → revert → run)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ticketera
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: ticketera_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ticketera -d ticketera_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USER: ticketera
+      DB_PASSWORD: ci_password
+      DB_NAME: ticketera_ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run migration:run
+      - run: npm run migration:revert
+      - run: npm run migration:run
+      # 7 tablas de dominio (users, tickets, ticket_comments,
+      # ticket_status_history, notifications, processed_emails,
+      # data_subject_requests) + `migrations`, la de control de TypeORM.
+      # CLAUDE.md dice "6 tablas": quedó desactualizado desde que se sumaron
+      # email-ingestion y los derechos ARCO. Este check usa el número real.
+      - name: Verificar que las 8 tablas quedaron creadas
+        run: |
+          docker exec "$(docker ps -qf 'ancestor=postgres:16-alpine')" \
+            psql -U ticketera -d ticketera_ci -t -c \
+            "select count(*) from information_schema.tables where table_schema = 'public';" \
+            | grep -qE '\b8\b' || { echo 'Se esperaban 8 tablas y no aparecieron'; exit 1; }
+
+  # --- Imágenes de los 6 procesos + escaneo de CVEs -------------------------
+  #
+  # Corre solo si el resto de los gates pasó: no tiene sentido construir y
+  # escanear seis imágenes de un commit que ya falló lint, tests o migraciones.
+  docker:
+    name: Build y scan de imágenes
+    needs: [lint, typecheck, test, audit, build, migrations]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - api-gateway
+          - bff-web
+          - users-service
+          - tickets-service
+          - notifications-service
+          - email-ingestion-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build ${{ matrix.app }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          build-args: |
+            APP_NAME=${{ matrix.app }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+          tags: ticketera-${{ matrix.app }}:ci
+          load: true
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+      # CRITICAL/HIGH corta el pipeline; solo sobre vulnerabilidades con fix
+      # publicado, para no bloquear por CVEs de la imagen base que todavía no
+      # tienen parche disponible en ningún lado.
+      - name: Escanear ${{ matrix.app }} con Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ticketera-${{ matrix.app }}:ci
+          format: sarif
+          output: trivy-${{ matrix.app }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+      - name: Publicar resultados en la pestaña Security
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-${{ matrix.app }}.sarif
+          category: trivy-${{ matrix.app }}
+
+      - name: Fallar si hay CRITICAL/HIGH con fix disponible
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ticketera-${{ matrix.app }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # --- E2E: los 6 procesos reales, atravesados por HTTP -------------------
+  #
+  # Los jobs de arriba prueban las piezas por separado (unit tests con mocks,
+  # migraciones contra Postgres, cada imagen aislada). Ninguno prueba que el
+  # sistema completo — gateway → BFF → RPC → Postgres → notificaciones —
+  # funcione junto. `test/e2e/ticketera.e2e-spec.ts` es justamente lo que la
+  # suite unitaria no puede ver: a quién llega cada notificación, que un 4xx
+  # repetido no abra un circuito, que la asignación sea idempotente.
+  #
+  # Corre después del job `docker` a propósito: no tiene sentido levantar los
+  # 6 servicios si ya sabemos que una imagen no compila o tiene un CVE crítico.
+  e2e:
+    name: E2E (stack completo)
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      # Secretos generados para esta corrida, nunca reutilizados: los scripts
+      # de compose exigen RPC_SHARED_SECRET/DB_PASSWORD/JWT_SECRET/CORS_ORIGINS
+      # (ver docker-compose.yml) y el esquema de Joi rechaza explícitamente los
+      # placeholders de .env.example, así que no alcanza con copiarlo.
+      - name: Generar .env efímero para el stack de CI
+        run: |
+          cat > .env <<EOF
+          DB_PASSWORD=$(openssl rand -base64 48 | tr -d '\n=+/')
+          JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n=+/')
+          RPC_SHARED_SECRET=$(openssl rand -base64 48 | tr -d '\n=+/')
+          CORS_ORIGINS=http://127.0.0.1:3000
+          EOF
+
+      - name: Levantar el stack (build + migraciones + los 6 procesos)
+        run: npm run docker:up
+
+      # `up -d` no espera a que TODO el árbol de depends_on esté healthy antes
+      # de devolver el control, solo ordena el arranque — así que el poll acá
+      # es necesario, no cosmético. /health/ready es público y liviano.
+      - name: Esperar a que el gateway esté ready
+        run: |
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/v1/health/ready || true)
+            [ "$code" = "200" ] && { echo "Gateway ready"; exit 0; }
+            sleep 2
+          done
+          echo "El gateway no quedó ready a tiempo"
+          docker compose --env-file .env -f docker/docker-compose.yml ps
+          exit 1
+
+      # Usuarios de prueba que la suite E2E usa como los cuatro actores
+      # (admin/supervisor/agentes/solicitante). El seed corre desde el host
+      # contra el puerto de Postgres publicado en loopback por el compose.
+      - name: Seed de usuarios de prueba
+        run: npm run seed
+
+      - name: Suite E2E
+        run: npm run test:e2e
+
+      - name: Logs de los 6 procesos (si algo falló)
+        if: failure()
+        run: docker compose --env-file .env -f docker/docker-compose.yml logs --tail=200
+
+      - name: Bajar el stack
+        if: always()
+        run: docker compose --env-file .env -f docker/docker-compose.yml down -v
