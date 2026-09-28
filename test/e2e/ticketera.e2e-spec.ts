@@ -118,6 +118,51 @@ async function countNotificationsFor(
   return (response.body.items ?? []).filter(predicate).length;
 }
 
+/**
+ * Camino más corto hasta CLOSED desde cada estado, según
+ * `ALLOWED_STATUS_TRANSITIONS`. Un supervisor puede recorrer cualquier
+ * transición de la máquina de estados sin importar su relación con el ticket.
+ */
+const PATH_TO_CLOSED: Record<string, string[]> = {
+  OPEN: ['CLOSED'],
+  ASSIGNED: ['CLOSED'],
+  IN_PROGRESS: ['RESOLVED', 'CLOSED'],
+  WAITING_CUSTOMER: ['RESOLVED', 'CLOSED'],
+  RESOLVED: ['CLOSED'],
+  CLOSED: [],
+};
+
+/**
+ * Cierra un ticket sin importar en qué estado haya quedado. Cada describe que
+ * crea y asigna tickets debe llamar esto en un `afterAll`: `openTickets` (la
+ * cuenta que usan las estrategias de asignación) excluye RESOLVED/CLOSED pero
+ * no ASSIGNED/IN_PROGRESS, así que un ticket que nunca se cierra sigue
+ * contando contra la capacidad del agente en la PRÓXIMA corrida de la suite.
+ * Sin este cierre, `agente.software` (maxConcurrentTickets: 15) terminaba
+ * superando el tope tras unas pocas corridas y la suite empezaba a fallar por
+ * acumulación de datos, no por un bug real.
+ */
+async function closeTicket(supervisor: Session, ticketId: string): Promise<void> {
+  const detail = await api().get(`/api/v1/tickets/${ticketId}`).set(auth(supervisor));
+  if (detail.status !== 200) return;
+
+  let status: string = detail.body.ticket.status;
+  for (const next of PATH_TO_CLOSED[status] ?? []) {
+    const response = await api()
+      .patch(`/api/v1/tickets/${ticketId}/status`)
+      .set(auth(supervisor))
+      .send({ status: next });
+    if (response.status !== 200) return;
+    status = next;
+  }
+}
+
+async function closeTickets(supervisor: Session, ticketIds: string[]): Promise<void> {
+  for (const id of ticketIds) {
+    await closeTicket(supervisor, id);
+  }
+}
+
 describe('Ticketera API (E2E)', () => {
   let accessToken = '';
   let ticketId = '';
@@ -468,6 +513,7 @@ describe('Idempotencia de la asignación', () => {
   let supervisor: Session;
   let agent: Session;
   let ticketId: string;
+  const createdTicketIds: string[] = [];
 
   beforeAll(async () => {
     [requester, supervisor, agent] = await Promise.all([
@@ -475,6 +521,15 @@ describe('Idempotencia de la asignación', () => {
       getSession('supervisor@ticketera.local'),
       getSession('agente.software@ticketera.local'),
     ]);
+  });
+
+  // `agent` (agente.software) tiene maxConcurrentTickets: 15. Sin cerrar los
+  // tickets que esta suite le asigna, cada corrida deja basura ASSIGNED que
+  // se acumula en la base compartida de desarrollo hasta que una corrida
+  // futura lo encuentra al tope y la estrategia skill-based deja de elegirlo
+  // — un fallo por contaminación de datos, no por un bug real.
+  afterAll(async () => {
+    await closeTickets(supervisor, createdTicketIds);
   });
 
   it('asignar dos veces al mismo agente no duplica el aviso de asignación', async () => {
@@ -489,6 +544,7 @@ describe('Idempotencia de la asignación', () => {
       })
       .expect(201);
     ticketId = created.body.id;
+    createdTicketIds.push(ticketId);
 
     await api()
       .post(`/api/v1/tickets/${ticketId}/assign`)
@@ -529,6 +585,7 @@ describe('Idempotencia de la asignación', () => {
         autoAssign: false,
       })
       .expect(201);
+    createdTicketIds.push(created.body.id);
 
     const results = await Promise.all([
       api()
@@ -627,6 +684,11 @@ describe('Filtros de búsqueda de tickets', () => {
 
     const ids = (response.body.items ?? []).map((t: { id: string }) => t.id);
     expect(ids).toContain(created.body.id);
+
+    // Igual que en el describe de idempotencia: sin cerrar este ticket, la
+    // próxima corrida encuentra a agente.software un ticket más cerca de su
+    // tope de capacidad.
+    await closeTicket(supervisor, created.body.id);
   });
 
   it('createdFrom sin createdTo acota el rango en vez de devolver la tabla entera', async () => {
