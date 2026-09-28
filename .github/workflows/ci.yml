@@ -46,6 +46,16 @@ jobs:
   test:
     name: Tests unitarios
     runs-on: ubuntu-latest
+    # AppConfigModule valida el entorno apenas se importa (ConfigModule.forRoot
+    # corre `validate` en el momento en que se evalúa el módulo, no cuando Nest
+    # arranca), y varios specs importan entidades que arrastran ese barrel — así
+    # que cualquier suite que toque una entidad exige RPC_SHARED_SECRET aunque
+    # el test en sí no use configuración. Sin `.env` en el runner (no está en
+    # el repo), el único requerido por el esquema (ver env.validation.ts) tiene
+    # que venir de acá. No es el secreto real: es un valor de una sola corrida,
+    # nunca usado para nada que hable con un servicio de verdad.
+    env:
+      RPC_SHARED_SECRET: ci-runner-only-secret-nunca-usado-fuera-de-este-job
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -106,12 +116,16 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+    # Ver la nota en el job `test`: importar las entidades para el data-source
+    # arrastra AppConfigModule, que valida el entorno al importarse. RPC_SHARED_SECRET
+    # es el único campo que el esquema exige siempre.
     env:
       DB_HOST: 127.0.0.1
       DB_PORT: 5432
       DB_USER: ticketera
       DB_PASSWORD: ci_password
       DB_NAME: ticketera_ci
+      RPC_SHARED_SECRET: ci-runner-only-secret-nunca-usado-fuera-de-este-job
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
