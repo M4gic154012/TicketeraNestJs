@@ -66,7 +66,15 @@ RUN apk add --no-cache dumb-init
 COPY package*.json ./
 # `--omit=dev` es obligatorio y no es redundante con el build: el webpack de Nest
 # externaliza node_modules, así que el bundle NO lleva las dependencias adentro.
-RUN npm ci --omit=dev && npm cache clean --force
+#
+# La imagen base trae su propia CLI de npm (con sus propias dependencias
+# transitivas, fuera de nuestro package-lock.json) instalada globalmente. El
+# runtime no la usa para nada -- el CMD de abajo llama a `node` directo -- así
+# que una vez que terminó de instalar las dependencias de producción, se borra:
+# sin eso, un scan de CVEs de la imagen final reporta vulnerabilidades de un
+# binario que ni siquiera se ejecuta.
+RUN npm ci --omit=dev && npm cache clean --force && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 COPY --from=build /app/dist ./dist
 
 # No correr como root: si el proceso se compromete, no debe tener privilegios
