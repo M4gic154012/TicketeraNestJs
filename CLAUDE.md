@@ -588,6 +588,60 @@ grande no se lea como sospechoso.
 para poder correr este tipo de revisión de mantenibilidad con análisis estático
 además de lectura manual.
 
+## Trazabilidad: el correlation-id llega hasta el microservicio (2026-09)
+
+`CorrelationIdMiddleware` siempre asignó un `x-correlation-id` en el borde HTTP
+del gateway y lo logueó ahí — pero moría en el borde. `UpstreamClient.send()`
+(y cualquier otro llamante de `withRpcAuth`) armaba el mensaje RPC sin
+adjuntarlo, así que cruzado el transporte interno, el log de `bff-web`,
+`tickets-service`, `users-service` o `notifications-service` no tenía forma de
+correlacionarse con el request HTTP que lo originó. Con seis procesos, eso
+significaba reconstruir a mano por timestamp aproximado cuál línea de qué
+proceso correspondía a qué request — exactamente lo que el propio middleware
+decía evitar, y solo lo evitaba para el primer salto.
+
+**Cómo se propaga ahora, sin que ningún caller lo pase a mano:**
+
+- `RequestContext` (`libs/common/src/context/request-context.ts`) — un
+  `AsyncLocalStorage` que guarda el correlation-id activo durante el ciclo de
+  vida de un request, HTTP o RPC.
+- `CorrelationIdMiddleware` abre ese contexto además de setear el header.
+- `withRpcAuth` lo lee del contexto y lo adjunta al payload saliente junto al
+  secreto compartido — automático en los ocho call sites que ya existían
+  (`UpstreamClient`, `ServiceClients` del BFF, `AuthService.login`, los
+  clientes de `tickets-service` hacia `users-service`, el forwarder de eventos
+  de integración, `email-ingestion` y `notifications-service`), sin tocar
+  ninguno.
+- `RpcCorrelationInterceptor` (`libs/common/src/interceptors/
+  rpc-correlation.interceptor.ts`), global en los cinco microservicios (junto
+  a `RpcAuthGuard` en cada `main.ts`) — extrae el correlation-id del mensaje
+  entrante, lo limpia del payload igual que `RpcAuthGuard` hace con el
+  secreto, y reabre el contexto para el resto del handler. Si ese handler
+  llama a su vez a otro servicio (`tickets-service` → `users-service`, por
+  ejemplo), lo hereda también sin código nuevo.
+- `AllRpcExceptionsFilter` suma `correlationId` a `SerializedRpcError` y a
+  cada línea de log de error — mismo campo que ya usaba
+  `http-exception.filter.ts` del lado del gateway.
+
+**Si no hay ningún `RequestContext` activo** (un job del scheduler, el poller
+de `email-ingestion`), `withRpcAuth` genera uno nuevo en el momento: esa cadena
+queda igual de trazable entre los servicios que toque, aunque no venga de un
+request HTTP.
+
+**Agregar un cliente RPC nuevo no requiere nada especial**: mientras pase por
+`withRpcAuth`, el correlation-id viaja solo. Lo que sí hay que hacer es
+registrar `RpcCorrelationInterceptor` como interceptor global en el `main.ts`
+de cualquier microservicio nuevo, igual que ya se hace con `RpcAuthGuard` —
+sin él, ese servicio sigue recibiendo el campo pero nunca lo lee, y sus propias
+llamadas salientes generan un correlation-id nuevo en cada una en lugar de
+heredar el de la cadena.
+
+Verificado contra el stack real, sin datos simulados: un 403 disparado a
+través del gateway (agente sin relación intentando cambiar el estado de un
+ticket ajeno) devuelve `x-correlation-id` en la respuesta HTTP, y ese mismo id
+aparece en el log de `tickets-service` — el proceso que evaluó el permiso y lo
+rechazó, tres saltos de red después del navegador.
+
 ## Ingesta de tickets por correo
 
 `email-ingestion-service` (TCP 4104) convierte correos en tickets. Es un servicio
