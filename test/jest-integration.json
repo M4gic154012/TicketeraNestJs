@@ -1,0 +1,15 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "testRegex": "test/integration/.*\\.integration-spec\\.ts$",
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "testEnvironment": "node",
+  "moduleNameMapper": {
+    "^@ticketera/common(|/.*)$": "<rootDir>/libs/common/src/$1",
+    "^@ticketera/database(|/.*)$": "<rootDir>/libs/database/src/$1",
+    "^@ticketera/patterns(|/.*)$": "<rootDir>/libs/patterns/src/$1"
+  },
+  "testPathIgnorePatterns": ["/node_modules/", "/dist/"]
+}

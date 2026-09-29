@@ -494,20 +494,43 @@ Vale como advertencia de qué evitar al escribir los próximos:
 - `notification.factory.spec.ts` contaba las notificaciones (`toHaveLength(1)`) y
   nunca verificaba **a quién** se le avisaba — que era justo lo que estaba mal.
 - `ticket.specifications.spec.ts` decía en su cabecera que `applyTo` se cubría "en
-  los tests de integración del repositorio". Esos tests no existen: la mitad que
-  corre en producción sigue sin cubrir.
+  los tests de integración del repositorio". Esos tests no existían: la mitad que
+  corre en producción seguía sin cubrir. Cerrado — ver `npm run test:integration`
+  más abajo.
 - El assert `getHours() <= 18` del SLA aceptaba las 18:45 y pasaba con casi cualquier
   hora del día. Ahora se afirma en minutos. (Las 18:00 exactas **sí** son válidas:
   son el cierre de la jornada, y ocurren cuando el SLA consume jornadas completas.)
 
-### `npm run test:e2e` está declarado pero no existe
+### `npm run test:e2e` (cerrado)
 
-Falta `test/jest-e2e.json` y los tests. Los tres escenarios que más valor tendrían,
-en orden: (1) ciclo de vida completo con los cuatro actores verificando **el
-destinatario** de cada notificación; (2) degradación con un dependiente caído,
-comprobando que N lecturas no autorizadas no abren ningún circuito; (3) concurrencia
-e idempotencia sobre el mismo ticket. Los tres cubren cosas que ningún test unitario
-puede ver.
+Existe `test/jest-e2e.json` y 24 tests que cubren los tres escenarios que más valor
+tenían: (1) ciclo de vida completo con los cuatro actores verificando **el
+destinatario** de cada notificación; (2) que un 4xx repetido no abra ningún circuito;
+(3) concurrencia e idempotencia sobre el mismo ticket. Los tres cubren cosas que
+ningún test unitario puede ver. Corre contra el stack de desarrollo real (o, en CI,
+contra el que el propio job `e2e` levanta con `docker compose`) — ver la sección de
+CI/CD.
+
+### Un tercer nivel: Specifications y repositorio contra Postgres real
+
+`npm test` solo verifica `isSatisfiedBy` (en memoria). La traducción a SQL de cada
+Specification (`applyTo`) y las consultas agregadas de `TicketsRepository`
+(`averageResolutionMinutes`, `findOverdueUnmarked`, `countByStatus`) no tenían
+ninguna cobertura contra un motor real — incluido si los índices GIN/parciales/
+funcionales que este esquema usa (ver la sección de base de datos) realmente se
+usan, verificado con `EXPLAIN` y `enable_seqscan=off` igual que se hace a mano.
+
+`npm run test:integration` (`test/integration/`, config en `test/jest-integration.json`)
+cubre eso, sin levantar los 6 procesos — eso ya lo hace `test:e2e`. Requiere:
+
+1. Una base dedicada, migrada: `DB_NAME=ticketera_integration npm run migration:run`
+   (o cualquier valor de `DB_NAME` que contenga `test` o `integration` — el
+   data-source de estos tests se niega a arrancar si no, porque `resetDatabase()`
+   trunca las tablas de dominio completas entre cada test).
+2. Correr con las mismas variables: `DB_NAME=ticketera_integration npm run test:integration`.
+
+En CI corre como el job `integration`, con su propio Postgres efímero — ver
+`.github/workflows/ci.yml`.
 
 ## Mantenibilidad: lo que dejó una pasada de limpieza (2026-09)
 
@@ -862,7 +885,9 @@ npm run start:dev
 
 # Verificación
 npm run build                 # compila los cinco (webpack, un main.js por app)
-npm test                      # suite completa
+npm test                      # suite completa (mocks, sin base)
+npm run test:integration      # Specifications + repositorio contra Postgres real
+npm run test:e2e              # los 6 procesos reales, atravesados por HTTP
 npm run lint
 
 # Producción / stack completo en Docker
@@ -937,14 +962,20 @@ npm run build && npm test && npm run lint
 
 En CI corren los mismos gates más algunos que localmente no se hacen
 (`.github/workflows/ci.yml`): `lint:ci` sin `--fix`, `npm audit --audit-level=high`,
-las migraciones contra un Postgres real con `run → revert → run`, y el build de las
-cinco imágenes con escaneo de CVEs.
+las migraciones contra un Postgres real con `run → revert → run`, `test:integration`
+(Specifications y repositorio contra Postgres real), y el build de las seis imágenes
+con escaneo de CVEs. El job `e2e` corre al final, atravesando los 6 procesos reales.
 
-Y si el cambio toca el flujo de tickets, probalo de verdad contra la API: la
-suite no cubre la interacción entre los cinco procesos.
+Y si el cambio toca el flujo de tickets, probalo de verdad contra la API (`npm run
+test:e2e`) además de la suite unitaria.
+
+Si agregaste o tocaste una Specification o una consulta del repositorio, sumale un
+caso a `npm run test:integration` — no alcanza con `isSatisfiedBy`, y es más barato
+de correr que levantar los 6 procesos con `test:e2e`.
 
 Si tocaste consultas o índices, medí con `EXPLAIN` antes de dar por bueno el
-cambio:
+cambio (`npm run test:integration` ya automatiza esto para lo que cubre; para todo
+lo demás, a mano):
 
 ```bash
 docker exec ticketera-postgres psql -U ticketera -d ticketera \

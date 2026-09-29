@@ -148,13 +148,54 @@ jobs:
             "select count(*) from information_schema.tables where table_schema = 'public';" \
             | grep -qE '\b8\b' || { echo 'Se esperaban 8 tablas y no aparecieron'; exit 1; }
 
+  # --- Specifications + repositorio contra un Postgres real ----------------
+  #
+  # `test` solo verifica `isSatisfiedBy` (en memoria, sin base). La traducción
+  # a SQL de cada Specification (`applyTo`) y las consultas agregadas del
+  # repositorio no tenían ninguna cobertura contra un motor real — ver la nota
+  # en ticket.specifications.spec.ts. Acotado a Specifications + repositorio:
+  # no levanta los 6 procesos (eso ya lo hace `e2e`), solo Postgres.
+  integration:
+    name: Specifications y repositorio (Postgres real)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ticketera
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: ticketera_integration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ticketera -d ticketera_integration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_USER: ticketera
+      DB_PASSWORD: ci_password
+      DB_NAME: ticketera_integration
+      RPC_SHARED_SECRET: ci-runner-only-secret-nunca-usado-fuera-de-este-job
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run migration:run
+      - run: npm run test:integration
+
   # --- Imágenes de los 6 procesos + escaneo de CVEs -------------------------
   #
   # Corre solo si el resto de los gates pasó: no tiene sentido construir y
   # escanear seis imágenes de un commit que ya falló lint, tests o migraciones.
   docker:
     name: Build y scan de imágenes
-    needs: [lint, typecheck, test, audit, build, migrations]
+    needs: [lint, typecheck, test, audit, build, migrations, integration]
     runs-on: ubuntu-latest
     permissions:
       contents: read
