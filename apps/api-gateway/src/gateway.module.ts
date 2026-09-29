@@ -2,7 +2,7 @@ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
-import { ClientsModule, Transport } from '@nestjs/microservices';
+import { ClientsModule } from '@nestjs/microservices';
 import { PassportModule } from '@nestjs/passport';
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import {
@@ -13,6 +13,7 @@ import {
   TICKETS_SERVICE,
   USERS_SERVICE,
   buildLoggerConfig,
+  registerRpcClient,
 } from '@ticketera/common';
 import { CircuitBreakerModule } from '@ticketera/patterns';
 import { LoggerModule } from 'nestjs-pino';
@@ -69,54 +70,10 @@ import {
       }),
     }),
     ClientsModule.registerAsync([
-      {
-        name: BFF_WEB_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('BFF_WEB_HOST'),
-            port: config.getOrThrow<number>('BFF_WEB_TCP_PORT'),
-          },
-        }),
-      },
-      {
-        name: TICKETS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('TICKETS_HOST'),
-            port: config.getOrThrow<number>('TICKETS_TCP_PORT'),
-          },
-        }),
-      },
-      {
-        name: USERS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('USERS_HOST'),
-            port: config.getOrThrow<number>('USERS_TCP_PORT'),
-          },
-        }),
-      },
-      {
-        name: NOTIFICATIONS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('NOTIFICATIONS_HOST'),
-            port: config.getOrThrow<number>('NOTIFICATIONS_TCP_PORT'),
-          },
-        }),
-      },
+      registerRpcClient(BFF_WEB_SERVICE, 'BFF_WEB_HOST', 'BFF_WEB_TCP_PORT'),
+      registerRpcClient(TICKETS_SERVICE, 'TICKETS_HOST', 'TICKETS_TCP_PORT'),
+      registerRpcClient(USERS_SERVICE, 'USERS_HOST', 'USERS_TCP_PORT'),
+      registerRpcClient(NOTIFICATIONS_SERVICE, 'NOTIFICATIONS_HOST', 'NOTIFICATIONS_TCP_PORT'),
     ]),
   ],
   controllers: [

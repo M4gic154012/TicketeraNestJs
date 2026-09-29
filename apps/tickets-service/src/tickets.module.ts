@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
-import { ClientsModule, Transport } from '@nestjs/microservices';
+import { ClientsModule } from '@nestjs/microservices';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import {
@@ -9,6 +8,7 @@ import {
   NOTIFICATIONS_SERVICE,
   USERS_SERVICE,
   buildLoggerConfig,
+  registerRpcClient,
 } from '@ticketera/common';
 import { DatabaseModule, Ticket, TicketComment, TicketStatusHistory } from '@ticketera/database';
 import { CircuitBreakerModule, DomainEventPublisher } from '@ticketera/patterns';
@@ -55,30 +55,8 @@ import {
     EventEmitterModule.forRoot({ wildcard: true, delimiter: '.', maxListeners: 20 }),
     ScheduleModule.forRoot(),
     ClientsModule.registerAsync([
-      {
-        name: USERS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('USERS_HOST'),
-            port: config.getOrThrow<number>('USERS_TCP_PORT'),
-          },
-        }),
-      },
-      {
-        name: NOTIFICATIONS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('NOTIFICATIONS_HOST'),
-            port: config.getOrThrow<number>('NOTIFICATIONS_TCP_PORT'),
-          },
-        }),
-      },
+      registerRpcClient(USERS_SERVICE, 'USERS_HOST', 'USERS_TCP_PORT'),
+      registerRpcClient(NOTIFICATIONS_SERVICE, 'NOTIFICATIONS_HOST', 'NOTIFICATIONS_TCP_PORT'),
     ]),
   ],
   controllers: [TicketsController],

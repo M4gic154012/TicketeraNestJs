@@ -1,8 +1,12 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
-import { ClientsModule, Transport } from '@nestjs/microservices';
+import { ClientsModule } from '@nestjs/microservices';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { AppConfigModule, USERS_SERVICE, buildLoggerConfig } from '@ticketera/common';
+import {
+  AppConfigModule,
+  USERS_SERVICE,
+  buildLoggerConfig,
+  registerRpcClient,
+} from '@ticketera/common';
 import { DatabaseModule, Notification } from '@ticketera/database';
 import { ScheduleModule } from '@nestjs/schedule';
 import { CircuitBreakerModule } from '@ticketera/patterns';
@@ -31,20 +35,7 @@ import { NotificationsController } from './notifications.controller';
     TypeOrmModule.forFeature([Notification]),
     CircuitBreakerModule,
     ScheduleModule.forRoot(),
-    ClientsModule.registerAsync([
-      {
-        name: USERS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('USERS_HOST'),
-            port: config.getOrThrow<number>('USERS_TCP_PORT'),
-          },
-        }),
-      },
-    ]),
+    ClientsModule.registerAsync([registerRpcClient(USERS_SERVICE, 'USERS_HOST', 'USERS_TCP_PORT')]),
   ],
   controllers: [NotificationsController],
   providers: [

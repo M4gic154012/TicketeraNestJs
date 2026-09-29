@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
-import { ClientsModule, Transport } from '@nestjs/microservices';
+import { ConfigService } from '@nestjs/config';
+import { ClientsModule } from '@nestjs/microservices';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import {
@@ -8,6 +8,7 @@ import {
   TICKETS_SERVICE,
   USERS_SERVICE,
   buildLoggerConfig,
+  registerRpcClient,
 } from '@ticketera/common';
 import { DatabaseModule, ProcessedEmail } from '@ticketera/database';
 import { CircuitBreakerModule } from '@ticketera/patterns';
@@ -33,30 +34,8 @@ import { MailboxPollerScheduler } from './infrastructure/scheduling';
     CircuitBreakerModule,
     ScheduleModule.forRoot(),
     ClientsModule.registerAsync([
-      {
-        name: USERS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('USERS_HOST'),
-            port: config.getOrThrow<number>('USERS_TCP_PORT'),
-          },
-        }),
-      },
-      {
-        name: TICKETS_SERVICE,
-        imports: [ConfigModule],
-        inject: [ConfigService],
-        useFactory: (config: ConfigService) => ({
-          transport: Transport.TCP,
-          options: {
-            host: config.getOrThrow<string>('TICKETS_HOST'),
-            port: config.getOrThrow<number>('TICKETS_TCP_PORT'),
-          },
-        }),
-      },
+      registerRpcClient(USERS_SERVICE, 'USERS_HOST', 'USERS_TCP_PORT'),
+      registerRpcClient(TICKETS_SERVICE, 'TICKETS_HOST', 'TICKETS_TCP_PORT'),
     ]),
   ],
   controllers: [EmailIngestionController],
