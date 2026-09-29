@@ -1,3 +1,4 @@
+export * from './bootstrap';
 export * from './contracts';
 export * from './events';
 export * from './config';
